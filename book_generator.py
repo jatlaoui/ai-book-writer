@@ -27,7 +27,19 @@ class BookGenerator:
         content = content.strip()
         
         return content
-    
+
+    def _prepare_chapter_context(self, chapter_number: int, prompt: str) -> str:
+        """Prepare context for chapter generation"""
+        if chapter_number == 1:
+            return f"Initial Chapter\nRequirements:\n{prompt}"
+            
+        context_parts = [
+            "Previous Chapter Summaries:",
+            *[f"Chapter {i+1}: {summary}" for i, summary in enumerate(self.chapters_memory)],
+            "\nCurrent Chapter Requirements:",
+            prompt
+        ]
+        return "\n".join(context_parts)
 
     def initiate_group_chat(self) -> autogen.GroupChat:
         """Create a new group chat for the agents with improved speaking order"""
@@ -60,71 +72,52 @@ class BookGenerator:
             speaker_selection_method="round_robin"
         )
 
-    def _get_sender(self, msg: Dict) -> str:
-        """Helper to get sender from message regardless of format"""
-        return msg.get("sender") or msg.get("name", "")
-
-    def _verify_chapter_complete(self, messages: List[Dict]) -> bool:
-        """Verify chapter completion by analyzing entire conversation context"""
-        print("******************** VERIFYING CHAPTER COMPLETION ****************")
-        current_chapter = None
-        chapter_content = None
-        sequence_complete = {
-            'memory_update': False,
-            'plan': False,
-            'setting': False,
-            'scene': False,
-            'feedback': False,
-            'scene_final': False,
-            'confirmation': False
-        }
+    def _handle_chapter_generation_failure(self, chapter_number: int, prompt: str) -> None:
+        """Handle failed chapter generation with simplified retry"""
+        print(f"Attempting simplified retry for Chapter {chapter_number}...")
         
-        # Analyze full conversation
-        for msg in messages:
-            content = msg.get("content", "")
+        try:
+            # Create a new group chat with just essential agents
+            retry_groupchat = autogen.GroupChat(
+                agents=[
+                    self.agents["user_proxy"],
+                    self.agents["story_planner"],
+                    self.agents["writer"]
+                ],
+                messages=[],
+                max_round=3
+            )
             
-            # Track chapter number
-            if not current_chapter:
-                num_match = re.search(r"Chapter (\d+):", content)
-                if num_match:
-                    current_chapter = int(num_match.group(1))
-            
-            # Track completion sequence
-            if "MEMORY UPDATE:" in content: sequence_complete['memory_update'] = True
-            if "PLAN:" in content: sequence_complete['plan'] = True
-            if "SETTING:" in content: sequence_complete['setting'] = True
-            if "SCENE:" in content: sequence_complete['scene'] = True
-            if "FEEDBACK:" in content: sequence_complete['feedback'] = True
-            if "SCENE FINAL:" in content:
-                sequence_complete['scene_final'] = True
-                chapter_content = content.split("SCENE FINAL:")[1].strip()
-            if "**Confirmation:**" in content and "successfully" in content:
-                sequence_complete['confirmation'] = True
+            manager = autogen.GroupChatManager(
+                groupchat=retry_groupchat,
+                llm_config={
+                    "config_list": self.agent_config["config_list"],
+                    "temperature": self.agent_config["temperature"],
+                    "timeout": self.agent_config["timeout"],
+                }
+            )
 
-            #print all sequence_complete flags
-            print("******************** SEQUENCE COMPLETE **************", sequence_complete)
-            print("******************** CURRENT_CHAPTER ****************", current_chapter)
-            print("******************** CHAPTER_CONTENT ****************", chapter_content)
-        
-        # Verify all steps completed and content exists
-        if all(sequence_complete.values()) and current_chapter and chapter_content:
-            self._save_chapter(current_chapter, chapter_content)
-            return True
+            retry_prompt = f"""Emergency chapter generation for Chapter {chapter_number}.
             
-        return False
-    
-    def _prepare_chapter_context(self, chapter_number: int, prompt: str) -> str:
-        """Prepare context for chapter generation"""
-        if chapter_number == 1:
-            return f"Initial Chapter\nRequirements:\n{prompt}"
+{prompt}
+
+Please generate this chapter in two steps:
+1. Story Planner: Create a basic outline (tag: PLAN)
+2. Writer: Write the complete chapter (tag: SCENE FINAL)
+
+Keep it simple and direct."""
+
+            self.agents["user_proxy"].initiate_chat(
+                manager,
+                message=retry_prompt
+            )
             
-        context_parts = [
-            "Previous Chapter Summaries:",
-            *[f"Chapter {i+1}: {summary}" for i, summary in enumerate(self.chapters_memory)],
-            "\nCurrent Chapter Requirements:",
-            prompt
-        ]
-        return "\n".join(context_parts)
+            # Save the retry results
+            self._process_chapter_results(chapter_number, retry_groupchat.messages)
+            
+        except Exception as e:
+            print(f"Error in retry attempt for Chapter {chapter_number}: {str(e)}")
+            print("Unable to generate chapter content after retry")
 
     def generate_chapter(self, chapter_number: int, prompt: str) -> None:
         """Generate a single chapter with completion verification"""
@@ -185,137 +178,6 @@ class BookGenerator:
         except Exception as e:
             print(f"Error in chapter {chapter_number}: {str(e)}")
             self._handle_chapter_generation_failure(chapter_number, prompt)
-
-    def _extract_final_scene(self, messages: List[Dict]) -> Optional[str]:
-        """Extract chapter content with improved content detection"""
-        for msg in reversed(messages):
-            content = msg.get("content", "")
-            sender = self._get_sender(msg)
-            
-            if sender in ["writer", "writer_final"]:
-                # Handle complete scene content
-                if "SCENE FINAL:" in content:
-                    scene_text = content.split("SCENE FINAL:")[1].strip()
-                    if scene_text:
-                        return scene_text
-                        
-                # Fallback to scene content
-                if "SCENE:" in content:
-                    scene_text = content.split("SCENE:")[1].strip()
-                    if scene_text:
-                        return scene_text
-                        
-                # Handle raw content
-                if len(content.strip()) > 100:  # Minimum content threshold
-                    return content.strip()
-                    
-        return None
-
-    def _handle_chapter_generation_failure(self, chapter_number: int, prompt: str) -> None:
-        """Handle failed chapter generation with simplified retry"""
-        print(f"Attempting simplified retry for Chapter {chapter_number}...")
-        
-        try:
-            # Create a new group chat with just essential agents
-            retry_groupchat = autogen.GroupChat(
-                agents=[
-                    self.agents["user_proxy"],
-                    self.agents["story_planner"],
-                    self.agents["writer"]
-                ],
-                messages=[],
-                max_round=3
-            )
-            
-            manager = autogen.GroupChatManager(
-                groupchat=retry_groupchat,
-                llm_config=self.agent_config
-            )
-
-            retry_prompt = f"""Emergency chapter generation for Chapter {chapter_number}.
-            
-{prompt}
-
-Please generate this chapter in two steps:
-1. Story Planner: Create a basic outline (tag: PLAN)
-2. Writer: Write the complete chapter (tag: SCENE FINAL)
-
-Keep it simple and direct."""
-
-            self.agents["user_proxy"].initiate_chat(
-                manager,
-                message=retry_prompt
-            )
-            
-            # Save the retry results
-            self._process_chapter_results(chapter_number, retry_groupchat.messages)
-            
-        except Exception as e:
-            print(f"Error in retry attempt for Chapter {chapter_number}: {str(e)}")
-            print("Unable to generate chapter content after retry")
-
-    def _process_chapter_results(self, chapter_number: int, messages: List[Dict]) -> None:
-        """Process and save chapter results, updating memory"""
-        try:
-            # Extract the Memory Keeper's final summary
-            memory_updates = []
-            for msg in reversed(messages):
-                sender = self._get_sender(msg)
-                content = msg.get("content", "")
-                
-                if sender == "memory_keeper" and "MEMORY UPDATE:" in content:
-                    update_start = content.find("MEMORY UPDATE:") + 14
-                    memory_updates.append(content[update_start:].strip())
-                    break
-            
-            # Add to memory even if no explicit update (use basic content summary)
-            if memory_updates:
-                self.chapters_memory.append(memory_updates[0])
-            else:
-                # Create basic memory from chapter content
-                chapter_content = self._extract_final_scene(messages)
-                if chapter_content:
-                    basic_summary = f"Chapter {chapter_number} Summary: {chapter_content[:200]}..."
-                    self.chapters_memory.append(basic_summary)
-            
-            # Extract and save the chapter content
-            self._save_chapter(chapter_number, messages)
-            
-        except Exception as e:
-            print(f"Error processing chapter results: {str(e)}")
-            raise
-
-    def _save_chapter(self, chapter_number: int, messages: List[Dict]) -> None:
-        print(f"\nSaving Chapter {chapter_number}")
-        try:
-            chapter_content = self._extract_final_scene(messages)
-            if not chapter_content:
-                raise ValueError(f"No content found for Chapter {chapter_number}")
-                
-            chapter_content = self._clean_chapter_content(chapter_content)
-            
-            filename = os.path.join(self.output_dir, f"chapter_{chapter_number:02d}.txt")
-            
-            # Create backup if file exists
-            if os.path.exists(filename):
-                backup_filename = f"{filename}.backup"
-                import shutil
-                shutil.copy2(filename, backup_filename)
-                
-            with open(filename, "w", encoding='utf-8') as f:
-                f.write(f"Chapter {chapter_number}\n\n{chapter_content}")
-                
-            # Verify file
-            with open(filename, "r", encoding='utf-8') as f:
-                saved_content = f.read()
-                if len(saved_content.strip()) == 0:
-                    raise IOError(f"File {filename} is empty")
-                    
-            print(f"✓ Saved to: {filename}")
-            
-        except Exception as e:
-            print(f"Error saving chapter: {str(e)}")
-            raise
 
     def generate_book(self, outline: List[Dict]) -> None:
         """Generate the book with strict chapter sequencing"""
